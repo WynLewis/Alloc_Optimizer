@@ -424,31 +424,50 @@ def _(NW, df, go, hist):
 
 @app.cell
 def _(NW, go, hist, np):
-    diff = hist["BB"] - hist["AAA"]
-    p25, p50, p75 = np.percentile(diff, [25, 50, 75])
+    diff_aaa_aa = hist["AA"] - hist["AAA"]
+    diff_aaa_a = hist["A"] - hist["AAA"]
+    diff_aaa_bb = hist["BB"] - hist["AAA"]
 
     fig_steep = go.Figure()
     fig_steep.add_trace(go.Scatter(
-        x=hist["date"], y=diff, mode="lines+markers",
-        name="AAA→BB spread", line=dict(color=NW["blue"], width=3),
+        x=hist["date"], y=diff_aaa_aa, mode="lines+markers",
+        name="AAA→AA (senior steepness)",
+        line=dict(color=NW["blue"], width=3),
     ))
-    for _pct_v, _lbl, _col in [(p25, "25th pct", NW["red"]),
-                               (p50, "Median", NW["dark_grey"]),
-                               (p75, "75th pct", NW["teal"])]:
+    fig_steep.add_trace(go.Scatter(
+        x=hist["date"], y=diff_aaa_a, mode="lines+markers",
+        name="AAA→A",
+        line=dict(color=NW["teal"], width=3),
+    ))
+    fig_steep.add_trace(go.Scatter(
+        x=hist["date"], y=diff_aaa_bb, mode="lines",
+        name="AAA→BB (reference)",
+        line=dict(color=NW["fossil"], width=1, dash="dot"),
+        opacity=0.55,
+    ))
+
+    # Percentile lines for the primary senior measure (AAA→AA)
+    p25_aa, p50_aa, p75_aa = np.percentile(diff_aaa_aa, [25, 50, 75])
+    for _pct_v, _lbl, _col in [(p25_aa, "AAA→AA 25th", NW["red"]),
+                               (p50_aa, "AAA→AA median", NW["dark_grey"]),
+                               (p75_aa, "AAA→AA 75th", NW["teal"])]:
         fig_steep.add_hline(y=_pct_v, line=dict(color=_col, dash="dash"),
                             annotation_text=f"{_lbl}: {_pct_v:.0f}",
                             annotation_position="right")
     fig_steep.update_layout(
-        title="Curve Steepness Through Time (AAA→BB)",
-        yaxis_title="AAA→BB Spread Differential (bps)",
+        title="Curve Steepness Through Time — senior focus (AAA→AA, AAA→A)",
+        yaxis_title="Spread Differential (bps)",
         xaxis_title="Date",
-        height=380,
+        height=420,
     )
+    # Keep the AAA→BB diff returned for other cells that consume it
+    diff = diff_aaa_bb
+    p25, p50, p75 = np.percentile(diff_aaa_bb, [25, 50, 75])
     return diff, fig_steep, p25, p50, p75
 
 
 @app.cell
-def _(diff, hist, np):
+def _(hist):
     def pct_rank(series, value):
         return float((series < value).sum()) / len(series) * 100.0
 
@@ -458,46 +477,77 @@ def _(diff, hist, np):
     cur_bbb = hist["BBB"].iloc[-1]
     cur_bb = hist["BB"].iloc[-1]
 
-    aaa_bb_cur = cur_bb - cur_aaa
+    aaa_aa_cur = cur_aa - cur_aaa
     aaa_a_cur = cur_a - cur_aaa
-    a_bb_cur = cur_bb - cur_a
+    aaa_bbb_cur = cur_bbb - cur_aaa
+    aaa_bb_cur = cur_bb - cur_aaa
 
-    aaa_bb_pct = pct_rank(diff, aaa_bb_cur)
+    aaa_aa_pct = pct_rank(hist["AA"] - hist["AAA"], aaa_aa_cur)
     aaa_a_pct = pct_rank(hist["A"] - hist["AAA"], aaa_a_cur)
-    a_bb_pct = pct_rank(hist["BB"] - hist["A"], a_bb_cur)
+    aaa_bbb_pct = pct_rank(hist["BBB"] - hist["AAA"], aaa_bbb_cur)
+    aaa_bb_pct = pct_rank(hist["BB"] - hist["AAA"], aaa_bb_cur)
 
-    steepness_ratio = cur_bb / cur_aaa
-    return aaa_a_cur, aaa_a_pct, aaa_bb_cur, aaa_bb_pct, a_bb_cur, a_bb_pct, steepness_ratio
+    aa_a_pct = pct_rank(hist["A"] - hist["AA"], cur_a - cur_aa)
+    steepness_ratio = cur_aa / cur_aaa  # senior steepness ratio
+    return (
+        aa_a_pct, aaa_a_cur, aaa_a_pct, aaa_aa_cur, aaa_aa_pct,
+        aaa_bb_cur, aaa_bb_pct, aaa_bbb_cur, aaa_bbb_pct, steepness_ratio,
+    )
 
 
 @app.cell
-def _(aaa_a_cur, aaa_a_pct, aaa_bb_cur, aaa_bb_pct, a_bb_cur, a_bb_pct, mo, steepness_ratio):
+def _(
+    aa_a_pct, aaa_a_cur, aaa_a_pct, aaa_aa_cur, aaa_aa_pct,
+    aaa_bb_cur, aaa_bb_pct, aaa_bbb_cur, aaa_bbb_pct, mo, steepness_ratio,
+):
     metrics_md = mo.md(f"""
+    **Senior-curve focus**
+
+    | Metric | Current | Percentile (vs 5yr history) |
+    |---|---|---|
+    | **AAA → AA spread** | **{aaa_aa_cur:.0f} bps** | **{aaa_aa_pct:.0f}%** |
+    | **AAA → A spread** | **{aaa_a_cur:.0f} bps** | **{aaa_a_pct:.0f}%** |
+    | AA → A spread | — | {aa_a_pct:.0f}% |
+    | Senior steepness ratio (AA / AAA) | **{steepness_ratio:.2f}x** | — |
+
+    *Reference (mezz / lower)*
+
     | Metric | Current | Percentile |
     |---|---|---|
-    | AAA → BB spread | **{aaa_bb_cur:.0f} bps** | {aaa_bb_pct:.0f}% |
-    | AAA → A spread | **{aaa_a_cur:.0f} bps** | {aaa_a_pct:.0f}% |
-    | A → BB spread | **{a_bb_cur:.0f} bps** | {a_bb_pct:.0f}% |
-    | Steepness ratio (BB / AAA) | **{steepness_ratio:.2f}x** | — |
+    | AAA → BBB spread | {aaa_bbb_cur:.0f} bps | {aaa_bbb_pct:.0f}% |
+    | AAA → BB spread | {aaa_bb_cur:.0f} bps | {aaa_bb_pct:.0f}% |
     """)
     return (metrics_md,)
 
 
 @app.cell
-def _(aaa_bb_pct, mo):
-    if aaa_bb_pct > 75:
+def _(aaa_a_pct, aaa_aa_pct, mo):
+    # Signal driven by the senior curve (AAA→AA primary, AAA→A confirming)
+    primary = aaa_aa_pct
+    if primary > 75:
         signal = mo.callout(
-            mo.md(f"**Curve steep — mezz tranches offer above-average compensation for incremental risk.** AAA→BB at {aaa_bb_pct:.0f}th percentile."),
+            mo.md(
+                f"**Senior curve steep — AAA→AA at {primary:.0f}th percentile, AAA→A at "
+                f"{aaa_a_pct:.0f}th.** Moving AAA→AA or AAA→A picks up above-average compensation "
+                f"for the incremental subordination loss."
+            ),
             kind="success",
         )
-    elif aaa_bb_pct < 25:
+    elif primary < 25:
         signal = mo.callout(
-            mo.md(f"**Curve flat — senior tranches offer better risk-adjusted value.** AAA→BB at {aaa_bb_pct:.0f}th percentile."),
+            mo.md(
+                f"**Senior curve flat — AAA→AA at {primary:.0f}th percentile, AAA→A at "
+                f"{aaa_a_pct:.0f}th.** AAA offers better risk-adjusted value than AA or A "
+                f"at these levels."
+            ),
             kind="warn",
         )
     else:
         signal = mo.callout(
-            mo.md(f"**Curve steepness near historical median.** AAA→BB at {aaa_bb_pct:.0f}th percentile."),
+            mo.md(
+                f"**Senior curve near median — AAA→AA at {primary:.0f}th percentile, "
+                f"AAA→A at {aaa_a_pct:.0f}th.** No strong relative-value signal in the senior stack."
+            ),
             kind="neutral",
         )
     return (signal,)
@@ -1061,8 +1111,19 @@ def _(base_df, custom_a, custom_aa, custom_aaa, custom_bb, custom_bbb, np, scena
 @app.cell
 def _(NW, base_df, cap_col, cur, go, np, pd, stressed, tranche_l):
     caps_v = base_df.set_index("Tranche").loc[tranche_l, cap_col].values.astype(float)
+    wals_v = base_df.set_index("Tranche").loc[tranche_l, "WAL"].values.astype(float)
+
     base_roc = cur / np.maximum(caps_v, 1e-6)
-    stressed_roc = stressed / np.maximum(caps_v, 1e-6)
+    # "New-money" ROC = forward yield on capital if you buy at stressed spreads
+    new_money_roc = stressed / np.maximum(caps_v, 1e-6)
+
+    # "Realized 1y ROC" for an existing position = (annual spread income - MTM hit
+    # over a 1y holding period assuming the move happens now) / capital
+    # MTM hit (bps) ≈ ΔSpread × WAL (DV01 approximation)
+    delta_bps = stressed - cur
+    mtm_hit_bps = delta_bps * wals_v
+    realized_1y_spread = cur - mtm_hit_bps  # one-year realized income
+    realized_roc = realized_1y_spread / np.maximum(caps_v, 1e-6)
 
     fig_stress = go.Figure()
     fig_stress.add_trace(go.Bar(
@@ -1070,22 +1131,35 @@ def _(NW, base_df, cap_col, cur, go, np, pd, stressed, tranche_l):
         marker_color=NW["blue"], text=np.round(base_roc, 1), textposition="outside",
     ))
     fig_stress.add_trace(go.Bar(
-        name="Stressed ROC", x=tranche_l, y=stressed_roc,
-        marker_color=NW["red"], text=np.round(stressed_roc, 1), textposition="outside",
+        name="Realized 1y ROC (existing position, MTM-adjusted)",
+        x=tranche_l, y=realized_roc,
+        marker_color=NW["red"], text=np.round(realized_roc, 1), textposition="outside",
+    ))
+    fig_stress.add_trace(go.Bar(
+        name="New-money ROC (deploy at stressed spreads)",
+        x=tranche_l, y=new_money_roc,
+        marker_color=NW["teal"], text=np.round(new_money_roc, 1), textposition="outside",
     ))
     fig_stress.update_layout(
-        barmode="group", title="ROC Before vs After Stress",
-        yaxis_title="ROC (bps per 1% capital)", xaxis_title="Tranche", height=420,
+        barmode="group",
+        title="ROC Before vs After Stress<br>"
+              "<sub>Red = existing position after MTM hit (1y).  "
+              "Teal = forward ROC on capital deployed at the new wider spreads.</sub>",
+        yaxis_title="ROC (bps per 1% capital)", xaxis_title="Tranche", height=460,
     )
+
+    stressed_roc = new_money_roc  # back-compat for downstream cells
 
     impact_df = pd.DataFrame({
         "Tranche": tranche_l,
         "Base Spread": cur.astype(int),
         "Stressed Spread": stressed.astype(int),
-        "Δ Spread (bps)": (stressed - cur).astype(int),
+        "Δ Spread (bps)": delta_bps.astype(int),
+        "MTM Hit (bps, 1y)": mtm_hit_bps.round(0).astype(int),
         "Capital %": caps_v,
         "Base ROC": np.round(base_roc, 1),
-        "Stressed ROC": np.round(stressed_roc, 1),
+        "Realized 1y ROC": np.round(realized_roc, 1),
+        "New-Money ROC": np.round(new_money_roc, 1),
     })
     return base_roc, fig_stress, impact_df, stressed_roc
 
