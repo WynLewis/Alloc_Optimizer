@@ -120,6 +120,17 @@ def _(mo):
     sub_bbb = mo.ui.number(value=11.0, step=0.5, label="BBB")
     sub_bb = mo.ui.number(value=7.0, step=0.5, label="BB")
 
+    wal_profile = mo.ui.dropdown(
+        options=[
+            "5nc2 (new-issue, full 5y reinvest / 2y non-call)",
+            "3nc1 (shorter 3y reinvest / 1y non-call)",
+            "0nc6m (post-reinvest, 6mo to call — short/amortizing)",
+            "Custom (use inputs below)",
+        ],
+        value="5nc2 (new-issue, full 5y reinvest / 2y non-call)",
+        label="WAL profile",
+    )
+
     wal_aaa = mo.ui.number(value=5.0, step=0.25, label="AAA")
     wal_aa = mo.ui.number(value=6.0, step=0.25, label="AA")
     wal_a = mo.ui.number(value=7.0, step=0.25, label="A")
@@ -138,11 +149,13 @@ def _(mo):
         mo.md("**Tranche spreads (bps over reference rate) — edit to match your deal**"),
         mo.hstack([spread_aaa, spread_aa, spread_a, spread_bbb, spread_bb, spread_eq],
                   justify="start", gap=0.5),
+        mo.md("**WAL profile** — pick a CLO structure or use Custom to enter tranche-by-tranche WALs below"),
+        wal_profile,
         mo.accordion({
             "Override subordination & WAL (per tranche)": mo.vstack([
                 mo.md("*Subordination % (credit enhancement below each tranche)*"),
                 mo.hstack([sub_aaa, sub_aa, sub_a, sub_bbb, sub_bb], justify="start", gap=0.5),
-                mo.md("*Weighted Average Life (years)*"),
+                mo.md("*Per-tranche WAL (yr) — only used when WAL profile = Custom*"),
                 mo.hstack([wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb], justify="start", gap=0.5),
             ]),
             "European overlay — cross-currency basis (for hedged EUR ROC)": mo.vstack([
@@ -155,7 +168,7 @@ def _(mo):
         basis_swap, capital_framework, default_rate, euribor, recovery_rate, region, sofr,
         spread_aaa, spread_aa, spread_a, spread_bbb, spread_bb, spread_eq,
         sub_aaa, sub_aa, sub_a, sub_bbb, sub_bb,
-        wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb,
+        wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb, wal_profile,
     )
 
 
@@ -193,6 +206,7 @@ def _(
     spread_aaa, spread_aa, spread_a, spread_bbb, spread_bb, spread_eq,
     sub_aaa, sub_aa, sub_a, sub_bbb, sub_bb,
     wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb,
+    wal_profile,
 ):
     # Start from the region's capital-charge columns / equity defaults
     if region.value == "EUR CLO":
@@ -204,16 +218,24 @@ def _(
         for _col in ["Spread", "Subordination", "WAL"]:
             base_df[_col] = (eur_defaults[_col] + us_defaults[_col]) / 2
 
-    # Override spreads / subordination / WAL with user inputs
+    # WAL profile presets (AAA, AA, A, BBB, BB, Equity)
+    if wal_profile.value.startswith("5nc2"):
+        effective_wals = [5.0, 6.0, 7.0, 7.5, 7.5, 0.0]
+    elif wal_profile.value.startswith("3nc1"):
+        effective_wals = [3.5, 4.5, 5.5, 6.0, 6.0, 0.0]
+    elif wal_profile.value.startswith("0nc6m"):
+        effective_wals = [1.5, 2.5, 3.5, 4.0, 4.0, 0.0]
+    else:  # Custom
+        effective_wals = [wal_aaa.value, wal_aa.value, wal_a.value,
+                          wal_bbb.value, wal_bb.value, 0.0]
+
     user_spreads = [spread_aaa.value, spread_aa.value, spread_a.value,
                     spread_bbb.value, spread_bb.value, spread_eq.value]
     user_subs = [sub_aaa.value, sub_aa.value, sub_a.value,
                  sub_bbb.value, sub_bb.value, 0.0]
-    user_wals = [wal_aaa.value, wal_aa.value, wal_a.value,
-                 wal_bbb.value, wal_bb.value, 0.0]
     base_df["Spread"] = user_spreads
     base_df["Subordination"] = user_subs
-    base_df["WAL"] = user_wals
+    base_df["WAL"] = effective_wals
     return (base_df,)
 
 
@@ -503,8 +525,9 @@ def _(mo):
     portfolio_size = mo.ui.number(value=1000.0, step=50.0, label="Portfolio Size ($mm)")
     max_capital = mo.ui.number(value=50.0, step=5.0, label="Max Capital Consumption ($mm)")
     wal_range = mo.ui.range_slider(
-        start=4.0, stop=8.0, step=0.1, value=(4.5, 7.0),
-        label="Target WAL Range (yr)", show_value=True,
+        start=0.0, stop=8.0, step=0.25, value=(4.5, 7.0),
+        label="Target WAL Range (yr) — widen for 3nc1 / 0nc6m profiles",
+        show_value=True,
     )
     opt_region = mo.ui.dropdown(
         options=["US Only", "EUR Only", "Combined (hedged)"],
@@ -670,19 +693,33 @@ def _(bounds_df, mo, preset, sum_max, sum_min):
 
 
 @app.cell
-def _(cap_col, eur_defaults, hedged_pickup_bps, opt_region, us_defaults):
+def _(base_df, cap_col, eur_defaults, hedged_pickup_bps, opt_region, region, us_defaults):
     def opt_inputs():
-        if opt_region.value == "EUR Only":
-            d = eur_defaults.copy()
-            d["EffSpread"] = d["Spread"] + hedged_pickup_bps
-        elif opt_region.value == "US Only":
+        if opt_region.value == "US Only":
             d = us_defaults.copy()
-            d["EffSpread"] = d["Spread"]
-        else:
+            match = (region.value == "US CLO")
+        elif opt_region.value == "EUR Only":
             d = eur_defaults.copy()
-            d["EffSpread"] = (d["Spread"] + hedged_pickup_bps + us_defaults["Spread"]) / 2.0
-            d["WAL"] = (eur_defaults["WAL"] + us_defaults["WAL"]) / 2.0
+            match = (region.value == "EUR CLO")
+        else:  # Combined (hedged)
+            d = eur_defaults.copy()
+            d["Spread"] = (eur_defaults["Spread"] + us_defaults["Spread"]) / 2.0
             d["Subordination"] = (eur_defaults["Subordination"] + us_defaults["Subordination"]) / 2.0
+            match = False
+
+        # If opt_region matches Section 1's region, use user-edited spreads / sub
+        if match:
+            d["Spread"] = base_df["Spread"].values
+            d["Subordination"] = base_df["Subordination"].values
+        # WAL always comes from base_df (the WAL profile dropdown is global)
+        d["WAL"] = base_df["WAL"].values
+
+        if opt_region.value == "EUR Only":
+            d["EffSpread"] = d["Spread"] + hedged_pickup_bps
+        elif opt_region.value == "Combined (hedged)":
+            d["EffSpread"] = d["Spread"] + hedged_pickup_bps / 2.0
+        else:
+            d["EffSpread"] = d["Spread"]
         d["Capital"] = d[cap_col]
         return d
     opt_df = opt_inputs()
@@ -718,10 +755,21 @@ def _(
     def _neg_roc(w):
         return -float(np.sum(w * spreads / np.maximum(caps, 1e-6)))
 
+    # Auto-relax WAL target if slider band doesn't intersect actual tranche WALs
+    _nz_wals = wals[wals > 0]
+    _wal_floor = float(_nz_wals.min()) if len(_nz_wals) else 0.0
+    _wal_ceil = float(_nz_wals.max()) if len(_nz_wals) else 8.0
+    _wal_lo = max(wal_range.value[0], _wal_floor)
+    _wal_hi = min(wal_range.value[1], _wal_ceil)
+    if _wal_lo > _wal_hi:
+        _wal_lo, _wal_hi = _wal_floor, _wal_ceil
+    wal_relaxed = (_wal_lo != wal_range.value[0]) or (_wal_hi != wal_range.value[1])
+    effective_wal_band = (_wal_lo, _wal_hi)
+
     _cons = [
         {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
-        {"type": "ineq", "fun": lambda w: wal_range.value[1] - float(np.sum(w * wals))},
-        {"type": "ineq", "fun": lambda w: float(np.sum(w * wals)) - wal_range.value[0]},
+        {"type": "ineq", "fun": lambda w: _wal_hi - float(np.sum(w * wals))},
+        {"type": "ineq", "fun": lambda w: float(np.sum(w * wals)) - _wal_lo},
         {"type": "ineq", "fun": lambda w: max_capital.value - float(np.sum(w * caps / 100.0)) * portfolio_size.value},
     ]
 
@@ -737,7 +785,7 @@ def _(
     optimal_w = _result.x if _result.success else _x0
     optimal_w = np.clip(optimal_w, 0, 1)
     optimal_w = optimal_w / max(optimal_w.sum(), 1e-9)
-    return caps, odf, optimal_w, spreads, tranche_order, wals
+    return caps, effective_wal_band, odf, optimal_w, spreads, tranche_order, wal_relaxed, wals
 
 
 @app.cell
@@ -830,7 +878,10 @@ def _(NW, caps, go, minimize, np, opt_df, optimal_w, spreads, tranche_order, wal
 
 
 @app.cell
-def _(compare_df, fig_pie, fig_sens, mo, optimal_cap, optimal_roc, optimal_wal):
+def _(
+    compare_df, effective_wal_band, fig_pie, fig_sens, mo,
+    optimal_cap, optimal_roc, optimal_wal, wal_relaxed,
+):
     _summary = mo.callout(
         mo.md(
             f"**Optimal portfolio:** ROC **{optimal_roc:.2f}** bps per 1% capital, "
@@ -838,13 +889,24 @@ def _(compare_df, fig_pie, fig_sens, mo, optimal_cap, optimal_roc, optimal_wal):
         ),
         kind="info",
     )
-    mo.vstack([
-        _summary,
+    _items = [_summary]
+    if wal_relaxed:
+        _items.append(mo.callout(
+            mo.md(
+                f"⚠ **WAL target auto-relaxed** to "
+                f"({effective_wal_band[0]:.2f}, {effective_wal_band[1]:.2f}) yrs "
+                f"because the slider band didn't overlap the tranche WALs "
+                f"(check the WAL profile in Section 1)."
+            ),
+            kind="warn",
+        ))
+    _items += [
         mo.hstack([mo.ui.plotly(fig_pie)], justify="start"),
         mo.md("**Comparison: Optimal vs Current vs Equal-Weight**"),
         mo.ui.table(compare_df, selection=None, page_size=10),
         mo.ui.plotly(fig_sens),
-    ])
+    ]
+    mo.vstack(_items)
     return
 
 
