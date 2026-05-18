@@ -61,7 +61,9 @@ def _(mo):
     mo.md(
         """
         # CLO Allocation Optimizer
-        ### Interactive ROC, curve-steepness, and portfolio optimization for European & US CLO tranches
+        ### US-focused ROC, curve-steepness, and portfolio optimization
+        *European tranches, managers, and cross-region analytics are available via the "European overlay" toggles inside the relevant sections.*
+
         ---
         """
     )
@@ -77,9 +79,9 @@ def _(mo):
 @app.cell
 def _(mo):
     region = mo.ui.dropdown(
-        options=["EUR CLO", "US CLO", "Combined"],
-        value="EUR CLO",
-        label="Region",
+        options=["US CLO", "EUR CLO", "Combined"],
+        value="US CLO",
+        label="Region (drives historical curve, equity yield, etc.)",
     )
     capital_framework = mo.ui.dropdown(
         options=[
@@ -102,19 +104,59 @@ def _(mo):
         label="Recovery Rate (%)",
         show_value=True,
     )
+
+    # Deal-specific spreads (defaults are current US CLO market)
+    spread_aaa = mo.ui.number(value=125, step=1, label="AAA")
+    spread_aa = mo.ui.number(value=175, step=1, label="AA")
+    spread_a = mo.ui.number(value=230, step=1, label="A")
+    spread_bbb = mo.ui.number(value=340, step=1, label="BBB")
+    spread_bb = mo.ui.number(value=650, step=1, label="BB")
+    spread_eq = mo.ui.number(value=1400, step=10, label="Equity")
+
+    # Subordination and WAL — defaults are US; user can override
+    sub_aaa = mo.ui.number(value=36.0, step=0.5, label="AAA")
+    sub_aa = mo.ui.number(value=26.0, step=0.5, label="AA")
+    sub_a = mo.ui.number(value=18.0, step=0.5, label="A")
+    sub_bbb = mo.ui.number(value=11.0, step=0.5, label="BBB")
+    sub_bb = mo.ui.number(value=7.0, step=0.5, label="BB")
+
+    wal_aaa = mo.ui.number(value=5.0, step=0.25, label="AAA")
+    wal_aa = mo.ui.number(value=6.0, step=0.25, label="AA")
+    wal_a = mo.ui.number(value=7.0, step=0.25, label="A")
+    wal_bbb = mo.ui.number(value=7.0, step=0.25, label="BBB")
+    wal_bb = mo.ui.number(value=7.0, step=0.25, label="BB")
+
+    # EUR-specific cross-currency inputs (collapsed by default)
     sofr = mo.ui.number(value=3.62, step=0.01, label="3mo SOFR (%)")
     euribor = mo.ui.number(value=2.11, step=0.01, label="3mo Euribor (%)")
     basis_swap = mo.ui.number(value=32.6, step=0.1, label="2yr basis swap (bps)")
 
     mo.vstack([
-        mo.md("**Choose region and capital framework**"),
+        mo.md("**Region, capital framework, and credit assumptions**"),
         mo.hstack([region, capital_framework], justify="start", gap=1.0),
-        mo.md("**Credit assumptions (used in loss-adjusted ROC)**"),
         mo.hstack([default_rate, recovery_rate], justify="start", gap=1.0),
-        mo.md("**Cross-currency basis (used for EUR hedged ROC)**"),
-        mo.hstack([sofr, euribor, basis_swap], justify="start", gap=1.0),
+        mo.md("**Tranche spreads (bps over reference rate) — edit to match your deal**"),
+        mo.hstack([spread_aaa, spread_aa, spread_a, spread_bbb, spread_bb, spread_eq],
+                  justify="start", gap=0.5),
+        mo.accordion({
+            "Override subordination & WAL (per tranche)": mo.vstack([
+                mo.md("*Subordination % (credit enhancement below each tranche)*"),
+                mo.hstack([sub_aaa, sub_aa, sub_a, sub_bbb, sub_bb], justify="start", gap=0.5),
+                mo.md("*Weighted Average Life (years)*"),
+                mo.hstack([wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb], justify="start", gap=0.5),
+            ]),
+            "European overlay — cross-currency basis (for hedged EUR ROC)": mo.vstack([
+                mo.md("*Only used when region = EUR CLO or Combined*"),
+                mo.hstack([sofr, euribor, basis_swap], justify="start", gap=1.0),
+            ]),
+        }),
     ])
-    return basis_swap, capital_framework, default_rate, euribor, recovery_rate, region, sofr
+    return (
+        basis_swap, capital_framework, default_rate, euribor, recovery_rate, region, sofr,
+        spread_aaa, spread_aa, spread_a, spread_bbb, spread_bb, spread_eq,
+        sub_aaa, sub_aa, sub_a, sub_bbb, sub_bb,
+        wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb,
+    )
 
 
 @app.cell
@@ -146,16 +188,32 @@ def _(pd):
 
 
 @app.cell
-def _(eur_defaults, region, us_defaults):
+def _(
+    eur_defaults, region, us_defaults,
+    spread_aaa, spread_aa, spread_a, spread_bbb, spread_bb, spread_eq,
+    sub_aaa, sub_aa, sub_a, sub_bbb, sub_bb,
+    wal_aaa, wal_aa, wal_a, wal_bbb, wal_bb,
+):
+    # Start from the region's capital-charge columns / equity defaults
     if region.value == "EUR CLO":
         base_df = eur_defaults.copy()
     elif region.value == "US CLO":
         base_df = us_defaults.copy()
     else:
-        # Combined = simple average of EUR & US defaults
         base_df = eur_defaults.copy()
         for _col in ["Spread", "Subordination", "WAL"]:
             base_df[_col] = (eur_defaults[_col] + us_defaults[_col]) / 2
+
+    # Override spreads / subordination / WAL with user inputs
+    user_spreads = [spread_aaa.value, spread_aa.value, spread_a.value,
+                    spread_bbb.value, spread_bb.value, spread_eq.value]
+    user_subs = [sub_aaa.value, sub_aa.value, sub_a.value,
+                 sub_bbb.value, sub_bb.value, 0.0]
+    user_wals = [wal_aaa.value, wal_aa.value, wal_a.value,
+                 wal_bbb.value, wal_bb.value, 0.0]
+    base_df["Spread"] = user_spreads
+    base_df["Subordination"] = user_subs
+    base_df["WAL"] = user_wals
     return (base_df,)
 
 
@@ -449,8 +507,8 @@ def _(mo):
         label="Target WAL Range (yr)", show_value=True,
     )
     opt_region = mo.ui.dropdown(
-        options=["EUR Only", "US Only", "Combined (hedged)"],
-        value="EUR Only",
+        options=["US Only", "EUR Only", "Combined (hedged)"],
+        value="US Only",
         label="Optimization Region",
     )
 
@@ -792,7 +850,11 @@ def _(compare_df, fig_pie, fig_sens, mo, optimal_cap, optimal_roc, optimal_wal):
 
 @app.cell
 def _(mo):
-    mo.md("---\n## Section 4 — Cross-Region Comparison")
+    mo.md(
+        "---\n"
+        "## Section 4 — Cross-Region Comparison *(European overlay)*\n"
+        "*Expand the panel below to compare EUR vs US tranche spreads and hedged ROC.*"
+    )
     return
 
 
@@ -862,12 +924,14 @@ def _(basis_swap, cmp_df, euribor, fig_cmp, hedged_pickup_bps, mo, rate_diff_bps
     )
     _show_cols = ["Tranche", "EUR Spread", "US Spread", "EUR Hedged Spread",
                   "EUR ROC", "US ROC", "EUR Hedged ROC", "Winner (Hedged)"]
-    mo.vstack([
-        mo.ui.plotly(fig_cmp),
-        mo.ui.table(cmp_df[_show_cols], selection=None, page_size=10),
-        basis_panel,
-        _summary,
-    ])
+    mo.accordion({
+        "▸ Show cross-region comparison (EUR vs US)": mo.vstack([
+            mo.ui.plotly(fig_cmp),
+            mo.ui.table(cmp_df[_show_cols], selection=None, page_size=10),
+            basis_panel,
+            _summary,
+        ]),
+    })
     return
 
 
@@ -1044,7 +1108,11 @@ def _(
 
 @app.cell
 def _(mo):
-    mo.md("---\n## Section 6 — Manager Quality Overlay")
+    mo.md(
+        "---\n"
+        "## Section 6 — Manager Quality Overlay *(European overlay)*\n"
+        "*Manager metrics shown are European CLO managers. Expand below to see.*"
+    )
     return
 
 
@@ -1155,17 +1223,23 @@ def _(base_df, cap_col, go, mgr, np, px, tranche_order):
 
 @app.cell
 def _(fig_hm, fig_mgr, mo, table):
-    mo.vstack([
-        table,
-        mo.ui.plotly(fig_mgr),
-        mo.ui.plotly(fig_hm),
-    ])
+    mo.accordion({
+        "▸ Show EU manager quality table, scatter, and adjusted-ROC heatmap": mo.vstack([
+            table,
+            mo.ui.plotly(fig_mgr),
+            mo.ui.plotly(fig_hm),
+        ]),
+    })
     return
 
 
 @app.cell
 def _(mo):
-    mo.md("---\n## Section 7 — Portfolio Correlation & Efficient Frontier")
+    mo.md(
+        "---\n"
+        "## Section 7 — Cross-Region Correlation & Efficient Frontier *(European overlay)*\n"
+        "*Shows the diversification case for adding EUR tranches to a US-only book.*"
+    )
     return
 
 
@@ -1308,11 +1382,13 @@ def _(combo_vol, cur_vol, div_pct, fig_corr, fig_ef, mo):
         ),
         kind="success",
     )
-    mo.vstack([
-        mo.ui.plotly(fig_corr),
-        mo.ui.plotly(fig_ef),
-        callout,
-    ])
+    mo.accordion({
+        "▸ Show cross-region correlation heatmap & efficient frontier": mo.vstack([
+            mo.ui.plotly(fig_corr),
+            mo.ui.plotly(fig_ef),
+            callout,
+        ]),
+    })
     return
 
 
