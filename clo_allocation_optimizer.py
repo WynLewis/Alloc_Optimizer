@@ -777,13 +777,40 @@ def _(base_df, cap_col, eur_defaults, hedged_pickup_bps, opt_region, region, us_
 
 
 @app.cell
+def _(mo):
+    objective_mode = mo.ui.radio(
+        options=["Pure ROC", "Pure Total Return", "Blend (Pareto)"],
+        value="Pure ROC",
+        label="Optimization objective",
+        inline=True,
+    )
+    roc_weight = mo.ui.slider(
+        start=0, stop=100, step=5, value=50,
+        label="Blend: ROC weight % (0 = pure TR, 100 = pure ROC)",
+        show_value=True,
+    )
+    mo.vstack([
+        mo.md(
+            "**Objective** — *Pure ROC* maximizes spread per unit of capital "
+            "(loads on AAA). *Pure Total Return* maximizes portfolio-weighted "
+            "spread income in bps (loads on BB / mezz). *Blend* finds the "
+            "Pareto-efficient point at your chosen weight."
+        ),
+        mo.hstack([objective_mode, roc_weight], justify="start", gap=1.0),
+    ])
+    return objective_mode, roc_weight
+
+
+@app.cell
 def _(
     effective_bounds,
     max_capital,
     minimize,
     np,
+    objective_mode,
     opt_df,
     portfolio_size,
+    roc_weight,
     wal_range,
 ):
     tranche_order = ["AAA", "AA", "A", "BBB", "BB", "Equity"]
@@ -796,16 +823,34 @@ def _(
     # Effective bounds come from preset + min-rating + max-concentration + per-tranche sliders
     _bnds = [(effective_bounds[t][0] / 100.0, effective_bounds[t][1] / 100.0)
              for t in tranche_order]
-    # Relax bounds if user picked an infeasible combo (mins sum > 1 or maxes sum < 1)
     _sum_min = sum(lo for lo, _ in _bnds)
     _sum_max = sum(hi for _, hi in _bnds)
     if _sum_min > 1.0 or _sum_max < 1.0:
         _bnds = [(0.0, 1.0) for _ in _bnds]
 
-    def _neg_roc(w):
-        return -float(np.sum(w * spreads / np.maximum(caps, 1e-6)))
+    # Per-tranche ROC and TR for normalization
+    _per_roc = spreads / np.maximum(caps, 1e-6)
+    _max_roc = float(np.max(_per_roc)) if np.max(_per_roc) > 0 else 1.0
+    _max_tr = float(np.max(spreads)) if np.max(spreads) > 0 else 1.0
+    _alpha = roc_weight.value / 100.0  # only used in Blend
 
-    # Auto-relax WAL target if slider band doesn't intersect actual tranche WALs
+    def _portfolio_roc(w):
+        return float(np.sum(w * _per_roc))
+
+    def _portfolio_tr(w):
+        return float(np.sum(w * spreads))
+
+    if objective_mode.value == "Pure ROC":
+        def _objective(w):
+            return -_portfolio_roc(w)
+    elif objective_mode.value == "Pure Total Return":
+        def _objective(w):
+            return -_portfolio_tr(w)
+    else:  # Blend (Pareto)
+        def _objective(w):
+            return -(_alpha * _portfolio_roc(w) / _max_roc
+                     + (1.0 - _alpha) * _portfolio_tr(w) / _max_tr)
+
     _nz_wals = wals[wals > 0]
     _wal_floor = float(_nz_wals.min()) if len(_nz_wals) else 0.0
     _wal_ceil = float(_nz_wals.max()) if len(_nz_wals) else 8.0
@@ -827,7 +872,7 @@ def _(
     _x0 = _x0 / max(_x0.sum(), 1e-9)
 
     _result = minimize(
-        _neg_roc, _x0,
+        _objective, _x0,
         method="SLSQP", bounds=_bnds, constraints=_cons,
         options={"maxiter": 400, "ftol": 1e-8},
     )
@@ -842,20 +887,22 @@ def _(
 def _(caps, np, optimal_w, pd, portfolio_size, spreads, tranche_order, wals):
     def summarize(w):
         port_roc = float(np.sum(w * spreads / np.maximum(caps, 1e-6)))
+        port_tr = float(np.sum(w * spreads))
         port_wal = float(np.sum(w * wals))
         port_cap = float(np.sum(w * caps / 100.0)) * portfolio_size.value
-        return port_roc, port_wal, port_cap
+        return port_roc, port_tr, port_wal, port_cap
 
-    optimal_roc, optimal_wal, optimal_cap = summarize(optimal_w)
+    optimal_roc, optimal_tr, optimal_wal, optimal_cap = summarize(optimal_w)
     current_w = np.array([0.70, 0.25, 0.05, 0.0, 0.0, 0.0])
     equal_w = np.array([1, 1, 1, 1, 1, 0]) / 5.0  # exclude equity by default
 
-    cur_roc, cur_wal, cur_cap = summarize(current_w)
-    eq_roc, eq_wal, eq_cap = summarize(equal_w)
+    cur_roc, cur_tr, cur_wal, cur_cap = summarize(current_w)
+    eq_roc, eq_tr, eq_wal, eq_cap = summarize(equal_w)
 
     compare_df = pd.DataFrame({
         "Allocation": ["Optimal", "Current (70/25/5)", "Equal-Weight (5 tranches)"],
         "Portfolio ROC": [round(optimal_roc, 1), round(cur_roc, 1), round(eq_roc, 1)],
+        "Portfolio TR (bps)": [round(optimal_tr, 1), round(cur_tr, 1), round(eq_tr, 1)],
         "Portfolio WAL": [round(optimal_wal, 2), round(cur_wal, 2), round(eq_wal, 2)],
         "Capital ($mm)": [round(optimal_cap, 1), round(cur_cap, 1), round(eq_cap, 1)],
     })
@@ -865,7 +912,83 @@ def _(caps, np, optimal_w, pd, portfolio_size, spreads, tranche_order, wals):
             round(current_w[_i] * 100, 1),
             round(equal_w[_i] * 100, 1),
         ]
-    return compare_df, optimal_cap, optimal_roc, optimal_wal
+    return compare_df, optimal_cap, optimal_roc, optimal_tr, optimal_wal
+
+
+@app.cell
+def _(
+    NW, caps, effective_wal_band, go, max_capital, minimize, np,
+    optimal_roc, optimal_tr, portfolio_size, roc_weight, spreads, wals,
+):
+    # Compute Pareto frontier by sweeping alpha across [0, 1]
+    _max_roc_asset = float(np.max(spreads / np.maximum(caps, 1e-6)))
+    _max_tr_asset = float(np.max(spreads))
+    _wal_lo, _wal_hi = effective_wal_band
+
+    def _solve(alpha):
+        def _obj(w):
+            return -(alpha * float(np.sum(w * spreads / np.maximum(caps, 1e-6))) / _max_roc_asset
+                     + (1.0 - alpha) * float(np.sum(w * spreads)) / _max_tr_asset)
+        _cons = [
+            {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
+            {"type": "ineq", "fun": lambda w: _wal_hi - float(np.sum(w * wals))},
+            {"type": "ineq", "fun": lambda w: float(np.sum(w * wals)) - _wal_lo},
+            {"type": "ineq", "fun": lambda w: max_capital.value - float(np.sum(w * caps / 100.0)) * portfolio_size.value},
+        ]
+        _x0 = np.array([1.0 / 6.0] * 6)
+        _r = minimize(_obj, _x0, method="SLSQP", bounds=[(0.0, 1.0)] * 6,
+                      constraints=_cons, options={"maxiter": 300, "ftol": 1e-7})
+        _w = _r.x if _r.success else _x0
+        _w = np.clip(_w, 0, 1)
+        _w = _w / max(_w.sum(), 1e-9)
+        return _w
+
+    _alphas = np.linspace(0.0, 1.0, 21)
+    _pts = []
+    for _a in _alphas:
+        _w = _solve(float(_a))
+        _pts.append((float(np.sum(_w * spreads)),
+                     float(np.sum(_w * spreads / np.maximum(caps, 1e-6))),
+                     float(_a)))
+    _tr_arr = [p[0] for p in _pts]
+    _roc_arr = [p[1] for p in _pts]
+
+    fig_pareto = go.Figure()
+    fig_pareto.add_trace(go.Scatter(
+        x=_tr_arr, y=_roc_arr, mode="lines+markers",
+        line=dict(color=NW["dark_blue"], width=3),
+        marker=dict(size=7, color=NW["med_blue"]),
+        name="Pareto frontier (sweep α)",
+        hovertemplate="TR %{x:.0f} bps · ROC %{y:.1f}<extra></extra>",
+    ))
+    # Mark the user's current selection
+    fig_pareto.add_trace(go.Scatter(
+        x=[optimal_tr], y=[optimal_roc],
+        mode="markers+text",
+        marker=dict(size=18, color=NW["orange"], symbol="star",
+                    line=dict(width=2, color=NW["charcoal"])),
+        text=[f"  Your selection (α={roc_weight.value}%)"],
+        textposition="middle right",
+        name="Your selection",
+    ))
+    # Anchor labels for the two extremes
+    fig_pareto.add_annotation(
+        x=_tr_arr[0], y=_roc_arr[0], text="Pure TR (max spread income)",
+        showarrow=True, arrowhead=2, ax=40, ay=20, font=dict(size=10),
+    )
+    fig_pareto.add_annotation(
+        x=_tr_arr[-1], y=_roc_arr[-1], text="Pure ROC (max spread/capital)",
+        showarrow=True, arrowhead=2, ax=-40, ay=-20, font=dict(size=10),
+    )
+    fig_pareto.update_layout(
+        title="Pareto Frontier — Total Return vs Return on Capital<br>"
+              "<sub>Each point is the best achievable ROC at that Total Return level "
+              "(subject to your WAL, capital, and bound constraints).</sub>",
+        xaxis_title="Portfolio Total Return (bps spread income)",
+        yaxis_title="Portfolio ROC (bps per 1% capital)",
+        height=460,
+    )
+    return (fig_pareto,)
 
 
 @app.cell
@@ -929,13 +1052,20 @@ def _(NW, caps, go, minimize, np, opt_df, optimal_w, spreads, tranche_order, wal
 
 @app.cell
 def _(
-    compare_df, effective_wal_band, fig_pie, fig_sens, mo,
-    optimal_cap, optimal_roc, optimal_wal, wal_relaxed,
+    compare_df, effective_wal_band, fig_pareto, fig_pie, fig_sens, mo,
+    objective_mode, optimal_cap, optimal_roc, optimal_tr, optimal_wal,
+    roc_weight, wal_relaxed,
 ):
+    _obj_label = objective_mode.value
+    if _obj_label.startswith("Blend"):
+        _obj_label = f"Blend @ {roc_weight.value}% ROC weight"
     _summary = mo.callout(
         mo.md(
-            f"**Optimal portfolio:** ROC **{optimal_roc:.2f}** bps per 1% capital, "
-            f"WAL **{optimal_wal:.2f}** yrs, capital consumed **${optimal_cap:.1f}mm**."
+            f"**Optimal portfolio** *(objective: {_obj_label})*: "
+            f"ROC **{optimal_roc:.2f}** bps/1% cap · "
+            f"Total Return **{optimal_tr:.1f}** bps · "
+            f"WAL **{optimal_wal:.2f}** yr · "
+            f"Capital **${optimal_cap:.1f}mm**."
         ),
         kind="info",
     )
@@ -954,6 +1084,7 @@ def _(
         mo.hstack([mo.ui.plotly(fig_pie)], justify="start"),
         mo.md("**Comparison: Optimal vs Current vs Equal-Weight**"),
         mo.ui.table(compare_df, selection=None, page_size=10),
+        mo.ui.plotly(fig_pareto),
         mo.ui.plotly(fig_sens),
     ]
     mo.vstack(_items)
