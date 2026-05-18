@@ -34,14 +34,15 @@ pio.templates["nationwide"] = go.layout.Template(
 )
 pio.templates.default = "nationwide"
 
-# --- Default inputs (mirror Section 1 of the notebook) ----------------------
-REGION = "EUR CLO"
+# --- Default inputs (US CLO, 5nc2 WAL profile) ----------------------------
+REGION = "US CLO"
 CAP_FRAMEWORK = "Basel III Standardized"
 DEFAULT_RATE_PCT = 2.0
 RECOVERY_RATE_PCT = 65.0
 SOFR = 3.62
 EURIBOR = 2.11
 BASIS_SWAP = 32.6
+WAL_PROFILE = "5nc2"  # 5y reinvest / 2y non-call (new-issue default)
 
 eur_defaults = pd.DataFrame({
     "Tranche": ["AAA", "AA", "A", "BBB", "BB", "Equity"],
@@ -66,27 +67,27 @@ us_defaults = pd.DataFrame({
 
 hedged_pickup_bps = 20.0 + (32.6 - BASIS_SWAP) * 0.4
 
-# --- Section 1: ROC by tranche ---------------------------------------------
-df = eur_defaults.copy()
+# Apply WAL profile (5nc2 default)
+_wal_5nc2 = [5.0, 6.0, 7.0, 7.5, 7.5, 0.0]
+us_defaults["WAL"] = _wal_5nc2
+
+# --- Section 1: ROC by tranche (US CLO) ------------------------------------
+df = us_defaults.copy()
 df["Capital Charge %"] = df[CAP_FRAMEWORK]
 base_el_bps = DEFAULT_RATE_PCT * (1.0 - RECOVERY_RATE_PCT / 100.0) * 10_000.0
 sub_factor = (1.0 - df["Subordination"] / 100.0).clip(lower=0.05)
 df["Expected Loss (bps)"] = (base_el_bps * sub_factor).round(1)
-df["Hedged Spread"] = df["Spread"] + hedged_pickup_bps
 df["ROC"] = (df["Spread"] / df["Capital Charge %"]).round(1)
 df["Loss-Adj ROC"] = ((df["Spread"] - df["Expected Loss (bps)"]).clip(lower=0)
                      / df["Capital Charge %"]).round(1)
-df["Hedged ROC"] = (df["Hedged Spread"] / df["Capital Charge %"]).round(1)
 
 fig_roc = go.Figure()
 fig_roc.add_trace(go.Bar(name="ROC (raw)", x=df["Tranche"], y=df["ROC"],
                          marker_color=NW["blue"], text=df["ROC"], textposition="outside"))
 fig_roc.add_trace(go.Bar(name="Loss-Adjusted ROC", x=df["Tranche"], y=df["Loss-Adj ROC"],
                          marker_color=NW["teal"], text=df["Loss-Adj ROC"], textposition="outside"))
-fig_roc.add_trace(go.Bar(name="Hedged ROC", x=df["Tranche"], y=df["Hedged ROC"],
-                         marker_color=NW["orange"], text=df["Hedged ROC"], textposition="outside"))
 fig_roc.update_layout(barmode="group",
-                     title=f"Section 1 — Return on Capital by Tranche ({REGION})",
+                     title=f"Section 1 — Return on Capital by Tranche ({REGION}, {WAL_PROFILE} profile)",
                      yaxis_title="ROC (bps spread per 1% capital)",
                      xaxis_title="Tranche", height=460)
 
@@ -97,11 +98,11 @@ hist = pd.DataFrame({
         "2022-06-30", "2022-12-31", "2023-06-30", "2023-12-31", "2024-06-30",
         "2024-12-31", "2025-06-30", "2025-12-31", "2026-03-31",
     ]),
-    "AAA": [250, 200, 160, 110, 105, 150, 190, 175, 155, 140, 130, 125, 128, 127],
-    "AA":  [400, 320, 250, 165, 155, 225, 290, 260, 230, 210, 195, 180, 185, 185],
-    "A":   [550, 450, 350, 235, 220, 325, 400, 370, 320, 290, 265, 245, 250, 240],
-    "BBB": [800, 650, 520, 370, 340, 480, 570, 530, 460, 420, 380, 350, 355, 350],
-    "BB":  [1200, 1050, 850, 650, 600, 800, 900, 850, 750, 700, 670, 650, 660, 650],
+    "AAA": [230, 185, 145, 100,  98, 140, 175, 160, 145, 132, 125, 120, 122, 125],
+    "AA":  [370, 295, 230, 150, 140, 210, 270, 245, 215, 195, 185, 170, 172, 175],
+    "A":   [520, 420, 320, 215, 200, 300, 375, 345, 300, 270, 250, 230, 235, 230],
+    "BBB": [750, 610, 480, 340, 310, 450, 540, 500, 430, 390, 360, 330, 335, 340],
+    "BB":  [1150, 1000, 800, 620, 575, 770, 870, 820, 720, 670, 650, 630, 640, 650],
 })
 tranches_l = ["AAA", "AA", "A", "BBB", "BB"]
 current = hist[tranches_l].iloc[-1].values
@@ -140,10 +141,10 @@ fig_steep.update_layout(title="Curve Steepness Through Time (AAA→BB)",
                        yaxis_title="AAA→BB Spread Differential (bps)",
                        xaxis_title="Date", height=380)
 
-# --- Section 3: Optimal allocation pie --------------------------------------
+# --- Section 3: Optimal allocation pie (US Only, $1bn) ---------------------
 tranche_order = ["AAA", "AA", "A", "BBB", "BB", "Equity"]
-odf = eur_defaults.set_index("Tranche").loc[tranche_order]
-spreads = (odf["Spread"] + hedged_pickup_bps).values.astype(float)
+odf = us_defaults.set_index("Tranche").loc[tranche_order]
+spreads = odf["Spread"].values.astype(float)
 caps = odf[CAP_FRAMEWORK].values.astype(float)
 wals = odf["WAL"].values.astype(float)
 
@@ -173,7 +174,7 @@ port_roc = float(np.sum(opt_w * spreads / np.maximum(caps, 1e-6)))
 port_wal = float(np.sum(opt_w * wals))
 port_cap = float(np.sum(opt_w * caps / 100.0)) * 1000.0
 fig_pie.update_layout(
-    title=f"Section 3 — Optimal Allocation ($1bn portfolio, EUR hedged)<br>"
+    title=f"Section 3 — Optimal Allocation ($1bn US CLO, 5nc2, default constraints)<br>"
           f"<sub>ROC {port_roc:.1f} | WAL {port_wal:.2f}y | Capital ${port_cap:.1f}mm</sub>",
     height=460,
 )
@@ -196,10 +197,10 @@ fig_cmp.update_layout(barmode="group",
                     title="Section 4 — EUR vs US Spreads (Hedged Equivalent)",
                     yaxis_title="Spread (bps)", xaxis_title="Tranche", height=440)
 
-# --- Section 5: Stress (Mar 2026 replay) -----------------------------------
-cur = eur_defaults.set_index("Tranche").loc[tranche_order, "Spread"].values.astype(float)
+# --- Section 5: Stress (Mar 2026 replay, US) -------------------------------
+cur = us_defaults.set_index("Tranche").loc[tranche_order, "Spread"].values.astype(float)
 stressed = np.array([132, 205, 280, 420, 750, cur[5]])
-caps_v = eur_defaults.set_index("Tranche").loc[tranche_order, CAP_FRAMEWORK].values.astype(float)
+caps_v = us_defaults.set_index("Tranche").loc[tranche_order, CAP_FRAMEWORK].values.astype(float)
 base_roc = cur / np.maximum(caps_v, 1e-6)
 stressed_roc = stressed / np.maximum(caps_v, 1e-6)
 
@@ -247,8 +248,8 @@ fig_mgr.update_layout(title="Section 6 — Manager Quality vs Spread (bubble = E
                     xaxis_title="Quality Score (0–100)", yaxis_title="WAS (bps)", height=480)
 
 adj = ((managers["quality_score"] - 50.0) / 500.0).values
-spreads_b = eur_defaults.set_index("Tranche").loc[tranche_order, "Spread"].values.astype(float)
-caps_b = eur_defaults.set_index("Tranche").loc[tranche_order, CAP_FRAMEWORK].values.astype(float)
+spreads_b = us_defaults.set_index("Tranche").loc[tranche_order, "Spread"].values.astype(float)
+caps_b = us_defaults.set_index("Tranche").loc[tranche_order, CAP_FRAMEWORK].values.astype(float)
 base_roc_v = spreads_b / np.maximum(caps_b, 1e-6)
 matrix = np.outer(1.0 + adj, base_roc_v)
 fig_hm = go.Figure(data=go.Heatmap(z=matrix, x=tranche_order, y=managers["name"].tolist(),
@@ -327,17 +328,17 @@ def render_table_html(df: pd.DataFrame) -> str:
     return df.to_html(index=False, classes="tbl", border=0)
 
 sections = [
-    ("Section 1 — Deal-Level ROC Analysis", [fig_roc],
+    ("Section 1 — Deal-Level ROC Analysis (US CLO, 5nc2)", [fig_roc],
      [("Tranche ROC table",
-       df[["Tranche", "Spread", "Hedged Spread", "Capital Charge %", "Subordination",
-           "WAL", "Expected Loss (bps)", "ROC", "Loss-Adj ROC", "Hedged ROC"]])]),
-    ("Section 2 — Curve Steepness Dashboard", [fig_curve, fig_steep], []),
-    ("Section 3 — Allocation Optimizer ($1bn EUR hedged, default constraints)",
-     [fig_pie], []),
-    ("Section 4 — Cross-Region Comparison", [fig_cmp], []),
+       df[["Tranche", "Spread", "Capital Charge %", "Subordination",
+           "WAL", "Expected Loss (bps)", "ROC", "Loss-Adj ROC"]])]),
+    ("Section 2 — Curve Steepness Dashboard (US)", [fig_curve, fig_steep], []),
+    ("Section 3 — Allocation Optimizer ($1bn US, 5nc2)", [fig_pie], []),
     ("Section 5 — Stress: Mar 2026 Replay", [fig_stress], []),
-    ("Section 6 — Manager Quality Overlay", [fig_mgr, fig_hm], []),
-    ("Section 7 — Correlation & Efficient Frontier", [fig_corr, fig_ef], []),
+    ("Section 4 — Cross-Region Comparison (European overlay)", [fig_cmp], []),
+    ("Section 6 — Manager Quality Overlay (European overlay)", [fig_mgr, fig_hm], []),
+    ("Section 7 — Correlation & Efficient Frontier (European overlay)",
+     [fig_corr, fig_ef], []),
 ]
 
 html_parts = ["""<!doctype html>
@@ -354,10 +355,16 @@ html_parts = ["""<!doctype html>
 </style></head><body>
 <h1>CLO Allocation Optimizer — Static Preview</h1>
 <div class="note">
-This is a <b>static rendering</b> at the notebook's default inputs (EUR CLO, Basel III Standardized,
-2% default rate, 65% recovery, $1bn portfolio). The actual app is <b>fully reactive</b> — every input
-(region, capital framework, spreads, sliders, presets) recalculates everything downstream.
-Run <code>marimo run clo_allocation_optimizer.py</code> for the live interactive version.
+<b>US CLO focus.</b> Static rendering at defaults: <b>US CLO</b>, <b>Basel III Standardized</b>,
+<b>5nc2 WAL profile</b> (5y reinvest / 2y non-call), 2% default rate, 65% recovery, $1bn portfolio.
+<br><br>
+Sections 4 (cross-region comparison), 6 (manager quality), and 7 (correlation / efficient frontier)
+are <b>European overlay</b> panels — in the live app they're collapsed by default but shown here
+so you can see the full surface area.
+<br><br>
+In the live app every input is reactive: region, capital framework, per-tranche spreads,
+WAL profile (5nc2 / 3nc1 / 0nc6m / Custom), subordination, constraints, presets, sliders all
+flow through. Run <code>marimo run clo_allocation_optimizer.py</code> locally for the interactive version.
 </div>
 """]
 
