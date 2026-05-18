@@ -454,6 +454,30 @@ def _(mo):
         label="Optimization Region",
     )
 
+    preset = mo.ui.dropdown(
+        options=[
+            "Custom (use sliders below)",
+            "AAA Only (100% AAA)",
+            "Senior-Heavy (≥70% AAA, no BBB/BB)",
+            "IG Only (AAA/AA/A, no BBB/BB)",
+            "No Mezz (0% BBB, 0% BB)",
+            "Conservative (≥80% AAA, ≤20% AA/A)",
+            "Balanced (max 40% any tranche)",
+            "Down-in-credit (max 30% AAA, force ≥10% BBB)",
+        ],
+        value="Custom (use sliders below)",
+        label="Constraint Preset",
+    )
+    min_rating = mo.ui.dropdown(
+        options=["AAA", "AA", "A", "BBB", "BB"],
+        value="BB",
+        label="Lowest acceptable rating",
+    )
+    max_concentration = mo.ui.slider(
+        start=10, stop=100, step=5, value=100,
+        label="Max single-tranche concentration (%)", show_value=True,
+    )
+
     min_aaa = mo.ui.range_slider(start=0, stop=100, step=5, value=(0, 100), label="AAA min/max %", show_value=True)
     min_aa = mo.ui.range_slider(start=0, stop=100, step=5, value=(0, 100), label="AA min/max %", show_value=True)
     min_a = mo.ui.range_slider(start=0, stop=100, step=5, value=(0, 100), label="A min/max %", show_value=True)
@@ -464,22 +488,127 @@ def _(mo):
     mo.vstack([
         mo.hstack([portfolio_size, max_capital, opt_region], justify="start", gap=1.0),
         wal_range,
-        mo.md("**Per-tranche bounds**"),
+        mo.md(
+            "**How constraints work** — pick a **preset** below for a one-click profile, "
+            "or use the per-tranche **min/max sliders** to set hard bounds directly "
+            "(e.g. set BBB max = 0 to exclude BBB entirely; set AAA min = 50 to require ≥50% AAA). "
+            "**Lowest acceptable rating** zeros-out everything below it. "
+            "**Max single-tranche concentration** caps the largest position for diversification."
+        ),
+        mo.hstack([preset, min_rating, max_concentration], justify="start", gap=1.0),
+        mo.md("**Per-tranche bounds** (used when preset = Custom; otherwise preset overrides)"),
         mo.hstack([min_aaa, min_aa, min_a], justify="start", gap=1.0),
         mo.hstack([min_bbb, min_bb, min_eq], justify="start", gap=1.0),
     ])
     return (
         max_capital,
+        max_concentration,
         min_a,
         min_aa,
         min_aaa,
         min_bb,
         min_bbb,
         min_eq,
+        min_rating,
         opt_region,
         portfolio_size,
+        preset,
         wal_range,
     )
+
+
+@app.cell
+def _(
+    max_concentration,
+    min_a,
+    min_aa,
+    min_aaa,
+    min_bb,
+    min_bbb,
+    min_eq,
+    min_rating,
+    pd,
+    preset,
+):
+    tranche_names = ["AAA", "AA", "A", "BBB", "BB", "Equity"]
+    rating_idx = {"AAA": 0, "AA": 1, "A": 2, "BBB": 3, "BB": 4, "Equity": 5}
+
+    # 1) Start from per-tranche sliders (used in Custom)
+    bounds = {
+        "AAA": list(min_aaa.value),
+        "AA": list(min_aa.value),
+        "A": list(min_a.value),
+        "BBB": list(min_bbb.value),
+        "BB": list(min_bb.value),
+        "Equity": list(min_eq.value),
+    }
+
+    # 2) Preset overrides
+    p = preset.value
+    if p == "AAA Only (100% AAA)":
+        bounds = {"AAA": [100, 100], "AA": [0, 0], "A": [0, 0],
+                  "BBB": [0, 0], "BB": [0, 0], "Equity": [0, 0]}
+    elif p == "Senior-Heavy (≥70% AAA, no BBB/BB)":
+        bounds = {"AAA": [70, 100], "AA": [0, 30], "A": [0, 30],
+                  "BBB": [0, 0], "BB": [0, 0], "Equity": [0, 0]}
+    elif p == "IG Only (AAA/AA/A, no BBB/BB)":
+        bounds = {"AAA": [0, 100], "AA": [0, 100], "A": [0, 100],
+                  "BBB": [0, 0], "BB": [0, 0], "Equity": [0, 0]}
+    elif p == "No Mezz (0% BBB, 0% BB)":
+        bounds = {"AAA": [0, 100], "AA": [0, 100], "A": [0, 100],
+                  "BBB": [0, 0], "BB": [0, 0], "Equity": [0, 0]}
+    elif p == "Conservative (≥80% AAA, ≤20% AA/A)":
+        bounds = {"AAA": [80, 100], "AA": [0, 20], "A": [0, 20],
+                  "BBB": [0, 0], "BB": [0, 0], "Equity": [0, 0]}
+    elif p == "Balanced (max 40% any tranche)":
+        bounds = {"AAA": [0, 40], "AA": [0, 40], "A": [0, 40],
+                  "BBB": [0, 40], "BB": [0, 40], "Equity": [0, 0]}
+    elif p == "Down-in-credit (max 30% AAA, force ≥10% BBB)":
+        bounds = {"AAA": [0, 30], "AA": [0, 40], "A": [0, 40],
+                  "BBB": [10, 50], "BB": [0, 30], "Equity": [0, 0]}
+
+    # 3) Apply minimum rating (zero-out anything below)
+    cutoff = rating_idx[min_rating.value]
+    for t, idx in rating_idx.items():
+        if idx > cutoff:
+            bounds[t] = [0, 0]
+
+    # 4) Apply max concentration cap to every tranche
+    for t in tranche_names:
+        if t == "Equity":
+            continue
+        bounds[t][1] = min(bounds[t][1], max_concentration.value)
+        bounds[t][0] = min(bounds[t][0], bounds[t][1])
+
+    effective_bounds = bounds
+    bounds_df = pd.DataFrame({
+        "Tranche": tranche_names,
+        "Min %": [bounds[t][0] for t in tranche_names],
+        "Max %": [bounds[t][1] for t in tranche_names],
+    })
+    sum_min = bounds_df["Min %"].sum()
+    sum_max = bounds_df["Max %"].sum()
+    return bounds_df, effective_bounds, sum_max, sum_min
+
+
+@app.cell
+def _(bounds_df, mo, preset, sum_max, sum_min):
+    feasible = (sum_min <= 100) and (sum_max >= 100)
+    if not feasible:
+        _kind, _msg = "danger", (
+            f"⚠ **Infeasible bounds:** mins sum to {sum_min:.0f}% (must be ≤ 100) "
+            f"and maxes sum to {sum_max:.0f}% (must be ≥ 100). Optimizer will relax."
+        )
+    else:
+        _kind, _msg = "info", (
+            f"**Effective bounds** (preset: *{preset.value}*) — "
+            f"Σmin = {sum_min:.0f}%, Σmax = {sum_max:.0f}%."
+        )
+    mo.vstack([
+        mo.callout(mo.md(_msg), kind=_kind),
+        mo.ui.table(bounds_df, selection=None, page_size=10),
+    ])
+    return
 
 
 @app.cell
@@ -504,13 +633,8 @@ def _(cap_col, eur_defaults, hedged_pickup_bps, opt_region, us_defaults):
 
 @app.cell
 def _(
+    effective_bounds,
     max_capital,
-    min_a,
-    min_aa,
-    min_aaa,
-    min_bb,
-    min_bbb,
-    min_eq,
     minimize,
     np,
     opt_df,
@@ -524,9 +648,14 @@ def _(
     caps = odf["Capital"].values.astype(float)
     wals = odf["WAL"].values.astype(float)
 
-    # Bounds per tranche from range sliders (convert pct to fraction)
-    _bounds_pct = [min_aaa.value, min_aa.value, min_a.value, min_bbb.value, min_bb.value, min_eq.value]
-    _bnds = [(lo / 100.0, hi / 100.0) for (lo, hi) in _bounds_pct]
+    # Effective bounds come from preset + min-rating + max-concentration + per-tranche sliders
+    _bnds = [(effective_bounds[t][0] / 100.0, effective_bounds[t][1] / 100.0)
+             for t in tranche_order]
+    # Relax bounds if user picked an infeasible combo (mins sum > 1 or maxes sum < 1)
+    _sum_min = sum(lo for lo, _ in _bnds)
+    _sum_max = sum(hi for _, hi in _bnds)
+    if _sum_min > 1.0 or _sum_max < 1.0:
+        _bnds = [(0.0, 1.0) for _ in _bnds]
 
     def _neg_roc(w):
         return -float(np.sum(w * spreads / np.maximum(caps, 1e-6)))
