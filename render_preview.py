@@ -1,18 +1,38 @@
 """Standalone static preview renderer for the CLO Allocation Optimizer.
 
-Replays the notebook's calculations at default inputs and writes every chart
-into a single self-contained HTML file you can open directly in a browser.
+Replays the notebook's calculations at the provided inputs and writes every
+chart into a single self-contained HTML file you can open directly.
 
-Run: python3 render_preview.py [output_path]
+Examples:
+  python3 render_preview.py                          # defaults
+  python3 render_preview.py -o out.html --portfolio 150 \
+        --spreads 119 140 165 280 480
 """
 from __future__ import annotations
 
-import sys
+import argparse
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 from scipy.optimize import minimize
+
+parser = argparse.ArgumentParser(description="Static preview renderer")
+parser.add_argument("-o", "--output", default="preview.html",
+                    help="Output HTML path")
+parser.add_argument("--portfolio", type=float, default=1000.0,
+                    help="Portfolio size in $mm (default: 1000)")
+parser.add_argument("--spreads", type=float, nargs=5,
+                    metavar=("AAA", "AA", "A", "BBB", "BB"),
+                    default=[125, 175, 230, 340, 650],
+                    help="Tranche spreads in bps (default: US 125/175/230/340/650)")
+parser.add_argument("--equity-spread", type=float, default=1400,
+                    help="Equity yield in bps (default: 1400)")
+parser.add_argument("--max-capital-pct", type=float, default=5.0,
+                    help="Max capital consumed as %% of portfolio (default: 5)")
+parser.add_argument("--wal-profile", choices=["5nc2", "3nc1", "0nc6m"],
+                    default="5nc2", help="WAL profile (default: 5nc2)")
+args = parser.parse_args()
 
 # --- Nationwide theme -------------------------------------------------------
 NW = dict(
@@ -34,7 +54,7 @@ pio.templates["nationwide"] = go.layout.Template(
 )
 pio.templates.default = "nationwide"
 
-# --- Default inputs (US CLO, 5nc2 WAL profile) ----------------------------
+# --- Inputs (US CLO; spreads/portfolio/profile from CLI args) -------------
 REGION = "US CLO"
 CAP_FRAMEWORK = "Basel III Standardized"
 DEFAULT_RATE_PCT = 2.0
@@ -42,7 +62,10 @@ RECOVERY_RATE_PCT = 65.0
 SOFR = 3.62
 EURIBOR = 2.11
 BASIS_SWAP = 32.6
-WAL_PROFILE = "5nc2"  # 5y reinvest / 2y non-call (new-issue default)
+WAL_PROFILE = args.wal_profile
+PORTFOLIO_MM = args.portfolio
+MAX_CAP_MM = args.portfolio * args.max_capital_pct / 100.0
+USER_SPREADS = list(args.spreads) + [args.equity_spread]  # AAA, AA, A, BBB, BB, Equity
 
 eur_defaults = pd.DataFrame({
     "Tranche": ["AAA", "AA", "A", "BBB", "BB", "Equity"],
@@ -67,9 +90,16 @@ us_defaults = pd.DataFrame({
 
 hedged_pickup_bps = 20.0 + (32.6 - BASIS_SWAP) * 0.4
 
-# Apply WAL profile (5nc2 default)
-_wal_5nc2 = [5.0, 6.0, 7.0, 7.5, 7.5, 0.0]
-us_defaults["WAL"] = _wal_5nc2
+# Apply WAL profile
+_wal_profiles = {
+    "5nc2": [5.0, 6.0, 7.0, 7.5, 7.5, 0.0],
+    "3nc1": [3.5, 4.5, 5.5, 6.0, 6.0, 0.0],
+    "0nc6m": [1.5, 2.5, 3.5, 4.0, 4.0, 0.0],
+}
+us_defaults["WAL"] = _wal_profiles[WAL_PROFILE]
+
+# Apply user-supplied spreads
+us_defaults["Spread"] = USER_SPREADS
 
 # --- Section 1: ROC by tranche (US CLO) ------------------------------------
 df = us_defaults.copy()
@@ -86,10 +116,15 @@ fig_roc.add_trace(go.Bar(name="ROC (raw)", x=df["Tranche"], y=df["ROC"],
                          marker_color=NW["blue"], text=df["ROC"], textposition="outside"))
 fig_roc.add_trace(go.Bar(name="Loss-Adjusted ROC", x=df["Tranche"], y=df["Loss-Adj ROC"],
                          marker_color=NW["teal"], text=df["Loss-Adj ROC"], textposition="outside"))
-fig_roc.update_layout(barmode="group",
-                     title=f"Section 1 — Return on Capital by Tranche ({REGION}, {WAL_PROFILE} profile)",
-                     yaxis_title="ROC (bps spread per 1% capital)",
-                     xaxis_title="Tranche", height=460)
+_sp = USER_SPREADS
+fig_roc.update_layout(
+    barmode="group",
+    title=(f"Section 1 — Return on Capital by Tranche ({REGION}, {WAL_PROFILE})<br>"
+           f"<sub>Spreads: AAA {_sp[0]:.0f} / AA {_sp[1]:.0f} / A {_sp[2]:.0f} / "
+           f"BBB {_sp[3]:.0f} / BB {_sp[4]:.0f} bps · Portfolio ${PORTFOLIO_MM:.0f}mm</sub>"),
+    yaxis_title="ROC (bps spread per 1% capital)",
+    xaxis_title="Tranche", height=460,
+)
 
 # --- Section 2: Curve steepness --------------------------------------------
 hist = pd.DataFrame({
@@ -105,7 +140,7 @@ hist = pd.DataFrame({
     "BB":  [1150, 1000, 800, 620, 575, 770, 870, 820, 720, 670, 650, 630, 640, 650],
 })
 tranches_l = ["AAA", "AA", "A", "BBB", "BB"]
-current = hist[tranches_l].iloc[-1].values
+current = np.array(USER_SPREADS[:5], dtype=float)  # user-supplied spreads
 six_mo = hist[tranches_l].iloc[-3].values
 one_yr = hist[tranches_l].iloc[-5].values
 mins = hist[tranches_l].min().values
@@ -152,11 +187,15 @@ def neg_roc(w):
     return -float(np.sum(w * spreads / np.maximum(caps, 1e-6)))
 
 bnds = [(0.0, 1.0)] * 6
+# Auto-pick a WAL band that overlaps the chosen profile's WALs
+_nzw = wals[wals > 0]
+_wal_lo = float(_nzw.min()) if len(_nzw) else 0.0
+_wal_hi = float(_nzw.max()) if len(_nzw) else 8.0
 cons = [
     {"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
-    {"type": "ineq", "fun": lambda w: 7.0 - float(np.sum(w * wals))},
-    {"type": "ineq", "fun": lambda w: float(np.sum(w * wals)) - 4.5},
-    {"type": "ineq", "fun": lambda w: 50.0 - float(np.sum(w * caps / 100.0)) * 1000.0},
+    {"type": "ineq", "fun": lambda w: _wal_hi - float(np.sum(w * wals))},
+    {"type": "ineq", "fun": lambda w: float(np.sum(w * wals)) - _wal_lo},
+    {"type": "ineq", "fun": lambda w: MAX_CAP_MM - float(np.sum(w * caps / 100.0)) * PORTFOLIO_MM},
 ]
 res = minimize(neg_roc, np.array([1/6]*6), method="SLSQP", bounds=bnds, constraints=cons,
                options={"maxiter": 400, "ftol": 1e-8})
@@ -172,10 +211,14 @@ fig_pie = go.Figure(data=[go.Pie(
 )])
 port_roc = float(np.sum(opt_w * spreads / np.maximum(caps, 1e-6)))
 port_wal = float(np.sum(opt_w * wals))
-port_cap = float(np.sum(opt_w * caps / 100.0)) * 1000.0
+port_cap = float(np.sum(opt_w * caps / 100.0)) * PORTFOLIO_MM
+# Dollar allocation per tranche
+alloc_mm = opt_w * PORTFOLIO_MM
 fig_pie.update_layout(
-    title=f"Section 3 — Optimal Allocation ($1bn US CLO, 5nc2, default constraints)<br>"
-          f"<sub>ROC {port_roc:.1f} | WAL {port_wal:.2f}y | Capital ${port_cap:.1f}mm</sub>",
+    title=(f"Section 3 — Optimal Allocation (${PORTFOLIO_MM:.0f}mm {REGION}, "
+           f"{WAL_PROFILE}, ≤${MAX_CAP_MM:.1f}mm capital)<br>"
+           f"<sub>Portfolio ROC {port_roc:.1f} | WAL {port_wal:.2f}y | "
+           f"Capital consumed ${port_cap:.1f}mm</sub>"),
     height=460,
 )
 
@@ -327,13 +370,30 @@ fig_ef.update_layout(title="Efficient Frontier (5yr return × vol)",
 def render_table_html(df: pd.DataFrame) -> str:
     return df.to_html(index=False, classes="tbl", border=0)
 
+alloc_df = pd.DataFrame({
+    "Tranche": tranche_order,
+    "Weight %": (opt_w * 100).round(1),
+    "Allocation ($mm)": np.round(alloc_mm, 1),
+    "Capital ($mm)": np.round(opt_w * caps / 100.0 * PORTFOLIO_MM, 2),
+})
+alloc_df = alloc_df[alloc_df["Weight %"] > 0.05].reset_index(drop=True)
+totals = pd.DataFrame({
+    "Tranche": ["TOTAL"],
+    "Weight %": [round(alloc_df["Weight %"].sum(), 1)],
+    "Allocation ($mm)": [round(alloc_df["Allocation ($mm)"].sum(), 1)],
+    "Capital ($mm)": [round(alloc_df["Capital ($mm)"].sum(), 2)],
+})
+alloc_df = pd.concat([alloc_df, totals], ignore_index=True)
+
 sections = [
-    ("Section 1 — Deal-Level ROC Analysis (US CLO, 5nc2)", [fig_roc],
+    (f"Section 1 — Deal-Level ROC Analysis ({REGION}, {WAL_PROFILE})", [fig_roc],
      [("Tranche ROC table",
        df[["Tranche", "Spread", "Capital Charge %", "Subordination",
            "WAL", "Expected Loss (bps)", "ROC", "Loss-Adj ROC"]])]),
-    ("Section 2 — Curve Steepness Dashboard (US)", [fig_curve, fig_steep], []),
-    ("Section 3 — Allocation Optimizer ($1bn US, 5nc2)", [fig_pie], []),
+    (f"Section 2 — Curve Steepness Dashboard ({REGION})", [fig_curve, fig_steep], []),
+    (f"Section 3 — Allocation Optimizer (${PORTFOLIO_MM:.0f}mm, {WAL_PROFILE}, "
+     f"≤${MAX_CAP_MM:.1f}mm capital)", [fig_pie],
+     [("Optimal allocation ($mm)", alloc_df)]),
     ("Section 5 — Stress: Mar 2026 Replay", [fig_stress], []),
     ("Section 4 — Cross-Region Comparison (European overlay)", [fig_cmp], []),
     ("Section 6 — Manager Quality Overlay (European overlay)", [fig_mgr, fig_hm], []),
@@ -355,18 +415,29 @@ html_parts = ["""<!doctype html>
 </style></head><body>
 <h1>CLO Allocation Optimizer — Static Preview</h1>
 <div class="note">
-<b>US CLO focus.</b> Static rendering at defaults: <b>US CLO</b>, <b>Basel III Standardized</b>,
-<b>5nc2 WAL profile</b> (5y reinvest / 2y non-call), 2% default rate, 65% recovery, $1bn portfolio.
+<b>US CLO focus.</b> Region: <b>{REGION}</b> · Capital framework: <b>Basel III Standardized</b> ·
+WAL profile: <b>{WAL_PROFILE}</b> · Default rate <b>{DEFAULT_RATE_PCT}%</b> · Recovery <b>{RECOVERY_RATE_PCT}%</b>.
+<br>
+Portfolio: <b>${PORTFOLIO_MM:.0f}mm</b>, max capital consumed: <b>${MAX_CAP_MM:.1f}mm</b>.
+<br>
+Spreads (bps): AAA <b>{SP0:.0f}</b> · AA <b>{SP1:.0f}</b> · A <b>{SP2:.0f}</b> · BBB <b>{SP3:.0f}</b> · BB <b>{SP4:.0f}</b>.
 <br><br>
 Sections 4 (cross-region comparison), 6 (manager quality), and 7 (correlation / efficient frontier)
-are <b>European overlay</b> panels — in the live app they're collapsed by default but shown here
-so you can see the full surface area.
+are <b>European overlay</b> panels — collapsed by default in the live app, shown here for reference.
 <br><br>
-In the live app every input is reactive: region, capital framework, per-tranche spreads,
-WAL profile (5nc2 / 3nc1 / 0nc6m / Custom), subordination, constraints, presets, sliders all
-flow through. Run <code>marimo run clo_allocation_optimizer.py</code> locally for the interactive version.
-</div>
-"""]
+The live app is fully reactive: spreads, WAL profile, portfolio size, constraint presets all flow
+through every chart. Run <code>marimo run clo_allocation_optimizer.py</code> locally.
+</div>""".replace("{REGION}", REGION).replace("{WAL_PROFILE}", WAL_PROFILE)
+       .replace("{DEFAULT_RATE_PCT}", f"{DEFAULT_RATE_PCT}")
+       .replace("{RECOVERY_RATE_PCT}", f"{RECOVERY_RATE_PCT}")
+       .replace("{PORTFOLIO_MM}", f"{PORTFOLIO_MM:.0f}")
+       .replace("{MAX_CAP_MM}", f"{MAX_CAP_MM:.1f}")
+       .replace("{SP0}", f"{USER_SPREADS[0]:.0f}")
+       .replace("{SP1}", f"{USER_SPREADS[1]:.0f}")
+       .replace("{SP2}", f"{USER_SPREADS[2]:.0f}")
+       .replace("{SP3}", f"{USER_SPREADS[3]:.0f}")
+       .replace("{SP4}", f"{USER_SPREADS[4]:.0f}")
+]
 
 include_js = True
 for title, figs, tables in sections:
@@ -381,7 +452,6 @@ for title, figs, tables in sections:
 
 html_parts.append("</body></html>")
 
-out_path = sys.argv[1] if len(sys.argv) > 1 else "preview.html"
-with open(out_path, "w") as f:
+with open(args.output, "w") as f:
     f.write("\n".join(html_parts))
-print(f"wrote {out_path}")
+print(f"wrote {args.output}")
